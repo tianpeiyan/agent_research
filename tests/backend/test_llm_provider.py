@@ -4,7 +4,8 @@ import json
 import httpx
 import pytest
 
-from app.llm import BailianLLMProvider, LLMError, LLMMessage
+from app.llm import BailianLLMProvider, LLMError, LLMMessage, LLMToolCallUnsupported
+from app.models import ToolDefinition
 
 
 def test_bailian_provider_posts_openai_compatible_chat_request() -> None:
@@ -63,3 +64,101 @@ def test_bailian_provider_rejects_invalid_response_shape() -> None:
 
     with pytest.raises(LLMError, match="invalid response"):
         asyncio.run(provider.complete([LLMMessage(role="user", content="Hello")]))
+
+
+def test_bailian_provider_posts_and_parses_native_tool_calls() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Need search.",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "search_web",
+                                        "arguments": "{\"query\":\"AI agents\"}",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    provider = BailianLLMProvider(
+        api_key="test-key",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        model="qwen-plus",
+        transport=httpx.MockTransport(handler),
+    )
+
+    turn = asyncio.run(
+        provider.complete_with_tools(
+            [LLMMessage(role="user", content="Pick a tool")],
+            tools=[
+                ToolDefinition(
+                    name="search_web",
+                    description="Search.",
+                    parameters={"type": "object", "properties": {}},
+                )
+            ],
+        )
+    )
+
+    payload = captured["payload"]
+    assert payload["tools"][0]["function"]["name"] == "search_web"
+    assert payload["tool_choice"] == "auto"
+    assert turn.content == "Need search."
+    assert turn.tool_calls[0].action == "search_web"
+    assert turn.tool_calls[0].arguments == {"query": "AI agents"}
+    assert turn.tool_calls[0].call_id == "call_1"
+
+
+def test_bailian_provider_can_disable_native_tool_calls() -> None:
+    provider = BailianLLMProvider(
+        api_key="test-key",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        model="qwen-plus",
+        supports_native_tools=False,
+    )
+
+    with pytest.raises(LLMToolCallUnsupported):
+        asyncio.run(provider.complete_with_tools([], tools=[]))
+
+
+def test_bailian_provider_maps_tools_unsupported_response_to_downgrade_error() -> None:
+    provider = BailianLLMProvider(
+        api_key="test-key",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        model="qwen-plus",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                400,
+                json={"message": "tools is unsupported for this model"},
+                request=request,
+            )
+        ),
+    )
+
+    with pytest.raises(LLMToolCallUnsupported):
+        asyncio.run(
+            provider.complete_with_tools(
+                [LLMMessage(role="user", content="Pick a tool")],
+                tools=[
+                    ToolDefinition(
+                        name="search_web",
+                        description="Search.",
+                        parameters={"type": "object", "properties": {}},
+                    )
+                ],
+            )
+        )

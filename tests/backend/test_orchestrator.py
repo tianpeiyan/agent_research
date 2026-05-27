@@ -3,11 +3,14 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
+from langgraph.graph.state import CompiledStateGraph
+
 from app.agents import ReportWriter, TaskSummarizer, TodoPlanner
 from app.llm import LLMMessage
 from app.models import ResearchTask, SSEEventType, SearchResult, TaskStatus, ToolCallStatus
 from app.orchestrator import ResearchOrchestrator
 from app.progress import ResearchProgressTracker
+from app.tool_calling import ToolCallingResearchExecutor, ToolRegistry
 from app.tools import NoteTool, ToolError
 
 
@@ -15,6 +18,7 @@ class MockLLM:
     def __init__(self, responses: list[str]) -> None:
         self.responses = responses
         self.calls: list[list[LLMMessage]] = []
+        self.supports_native_tools = False
 
     async def complete(
         self,
@@ -23,6 +27,35 @@ class MockLLM:
     ) -> str:
         self.calls.append(list(messages))
         return self.responses.pop(0)
+
+
+def _action(action: str, arguments: dict[str, object] | None = None) -> str:
+    return json.dumps(
+        {
+            "action": action,
+            "arguments": arguments or {},
+            "reason": f"Run {action}.",
+        }
+    )
+
+
+def _task_actions(query: str) -> list[str]:
+    return [
+        _action("search_web", {"query": query}),
+        _action("summarize_task"),
+        _action("save_note"),
+        _action("final"),
+    ]
+
+
+def _task_script(query: str, summary: str) -> list[str]:
+    return [
+        _action("search_web", {"query": query}),
+        _action("summarize_task"),
+        summary,
+        _action("save_note"),
+        _action("final"),
+    ]
 
 
 class MockSearchTool:
@@ -69,8 +102,9 @@ class OrderedSearchTool:
 
 
 class OrderedSummarizer:
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: list[str], llm: MockLLM) -> None:
         self.events = events
+        self.llm = llm
 
     async def summarize(
         self,
@@ -100,17 +134,23 @@ class OrderedNoteTool:
 class OrderedReportWriter:
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self.evidence_judgements = []
 
-    async def write(self, topic: str, summaries):
+    async def write(self, topic: str, summaries, evidence_judgement=None):
         self.events.append("report")
+        self.evidence_judgements.append(evidence_judgement)
         from app.models import FinalReport
 
         sources = [source for summary in summaries for source in summary.sources]
+        evidence_note = ""
+        if evidence_judgement is not None and not evidence_judgement.is_sufficient:
+            evidence_note = "证据不足：部分结论待验证，仅供参考。"
         return FinalReport(
             title=topic,
             markdown=(
                 f"# {topic}\n\n"
                 "## Overview\nDone.\n\n"
+                f"{evidence_note}\n\n"
                 "## Sectioned Analysis\nDone.\n\n"
                 "## Conclusion\nDone.\n\n"
                 "## References\n"
@@ -120,8 +160,92 @@ class OrderedReportWriter:
         )
 
 
+class OrderedEvidenceJudge:
+    def __init__(self, events: list[str], is_sufficient: bool = True) -> None:
+        self.events = events
+        self.is_sufficient = is_sufficient
+
+    async def judge(self, topic, completed_summaries, sources, failed_tasks):
+        self.events.append("evidence")
+        from app.models import EvidenceConfidence, EvidenceJudgement
+
+        return EvidenceJudgement(
+            is_sufficient=self.is_sufficient,
+            confidence=EvidenceConfidence.HIGH if self.is_sufficient else EvidenceConfidence.LOW,
+            gaps=[] if self.is_sufficient else ["Need more sources."],
+            rationale="Enough evidence." if self.is_sufficient else "Evidence is incomplete.",
+        )
+
+
+class RecordingEvidenceJudge:
+    def __init__(self, events: list[str], sufficiency_by_call: list[bool]) -> None:
+        self.events = events
+        self.sufficiency_by_call = sufficiency_by_call
+        self.sources_by_call: list[list[SearchResult]] = []
+
+    async def judge(self, topic, completed_summaries, sources, failed_tasks):
+        self.events.append("evidence")
+        self.sources_by_call.append(list(sources))
+        from app.models import EvidenceConfidence, EvidenceJudgement
+
+        is_sufficient = self.sufficiency_by_call.pop(0)
+        return EvidenceJudgement(
+            is_sufficient=is_sufficient,
+            confidence=EvidenceConfidence.HIGH if is_sufficient else EvidenceConfidence.LOW,
+            gaps=[] if is_sufficient else ["Need stronger source coverage."],
+            rationale="Enough evidence." if is_sufficient else "Evidence is incomplete.",
+        )
+
+
+class OrderedQueryRewriter:
+    def __init__(self, events: list[str], queries: list[str]) -> None:
+        self.events = events
+        self.queries = queries
+        self.calls: list[dict[str, object]] = []
+
+    async def rewrite(
+        self,
+        *,
+        topic,
+        evidence_gaps,
+        existing_task_queries,
+        existing_source_summaries,
+        max_queries=2,
+    ):
+        self.events.append("rewrite")
+        self.calls.append(
+            {
+                "topic": topic,
+                "evidence_gaps": list(evidence_gaps),
+                "existing_task_queries": list(existing_task_queries),
+                "existing_source_summaries": list(existing_source_summaries),
+                "max_queries": max_queries,
+            }
+        )
+        return self.queries[:max_queries]
+
+
+class SupplementalSearchTool:
+    def __init__(self, events: list[str], results_by_query: dict[str, list[SearchResult]]) -> None:
+        self.events = events
+        self.results_by_query = results_by_query
+        self.calls: list[str] = []
+
+    async def search(self, task: ResearchTask) -> list[SearchResult]:
+        self.events.append(f"search:{task.query}")
+        self.calls.append(task.query)
+        if task.query == "failed supplemental":
+            raise ToolError("search_failed", "Supplemental search failed.")
+        return self.results_by_query[task.query]
+
+
+class FailingEvidenceJudge:
+    async def judge(self, topic, completed_summaries, sources, failed_tasks):
+        raise RuntimeError("judge failed with token=evidence-secret")
+
+
 class FailingReportWriter:
-    async def write(self, topic: str, summaries):
+    async def write(self, topic: str, summaries, evidence_judgement=None):
         raise RuntimeError("Report must include a title, overview, conclusion, and references.")
 
 
@@ -144,9 +268,9 @@ def test_orchestrator_completes_full_mock_research_flow(tmp_path: Path) -> None:
                     {"title": "Task C", "intent": "Intent C", "query": "query c"},
                 ]
             ),
-            "### Summary A\nFinding A [1].",
-            "### Summary B\nFinding B [1].",
-            "### Summary C\nFinding C [1].",
+            *_task_script("query a", "### Summary A\nFinding A [1]."),
+            *_task_script("query b", "### Summary B\nFinding B [1]."),
+            *_task_script("query c", "### Summary C\nFinding C [1]."),
             "\n".join(
                 [
                     "# AI Research Agents",
@@ -221,43 +345,16 @@ def test_orchestrator_completes_full_mock_research_flow(tmp_path: Path) -> None:
         for event in progress.events
         if event.type == SSEEventType.STATUS
     ]
-    assert status_messages == [
-        "正在规划",
-        "正在搜索",
-        "正在总结",
-        "任务完成",
-        "正在搜索",
-        "正在总结",
-        "任务完成",
-        "正在搜索",
-        "正在总结",
-        "任务完成",
-        "报告生成完成",
-    ]
-    assert [event.type for event in progress.events] == [
-        SSEEventType.STATUS,
-        SSEEventType.TASK,
-        SSEEventType.TASK,
-        SSEEventType.STATUS,
-        SSEEventType.SEARCH_RESULTS,
-        SSEEventType.STATUS,
-        SSEEventType.SUMMARY,
-        SSEEventType.STATUS,
-        SSEEventType.TASK,
-        SSEEventType.TASK,
-        SSEEventType.STATUS,
-        SSEEventType.SEARCH_RESULTS,
-        SSEEventType.STATUS,
-        SSEEventType.SUMMARY,
-        SSEEventType.STATUS,
-        SSEEventType.TASK,
-        SSEEventType.TASK,
-        SSEEventType.STATUS,
-        SSEEventType.SEARCH_RESULTS,
-        SSEEventType.STATUS,
-        SSEEventType.SUMMARY,
-        SSEEventType.STATUS,
-        SSEEventType.TASK,
+    assert status_messages[0] == "正在规划"
+    assert status_messages.count("已降级为 JSON 工具调用") == 3
+    assert status_messages.count("模型正在选择工具") == 12
+    assert status_messages.count("正在执行工具") == 9
+    assert status_messages.count("任务完成") == 3
+    assert status_messages[-1] == "报告生成完成"
+    event_types = [event.type for event in progress.events]
+    assert event_types.count(SSEEventType.SEARCH_RESULTS) == 3
+    assert event_types.count(SSEEventType.SUMMARY) == 3
+    assert event_types[-3:] == [
         SSEEventType.REPORT,
         SSEEventType.STATUS,
         SSEEventType.DONE,
@@ -281,8 +378,9 @@ def test_orchestrator_records_failed_subtask_and_reports_completed_work(
                     {"title": "Task C", "intent": "Intent C", "query": "query c"},
                 ]
             ),
-            "### Summary A\nFinding A [1].",
-            "### Summary C\nFinding C [1].",
+            *_task_script("query a", "### Summary A\nFinding A [1]."),
+            _action("search_web", {"query": "failed query"}),
+            *_task_script("query c", "### Summary C\nFinding C [1]."),
             "\n".join(
                 [
                     "# Partial Report",
@@ -352,7 +450,10 @@ def test_orchestrator_returns_clear_empty_report_when_all_subtasks_fail(
                         "query": "failed query",
                     },
                 ]
-            )
+            ),
+            _action("search_web", {"query": "failed query"}),
+            _action("search_web", {"query": "failed query"}),
+            _action("search_web", {"query": "failed query"}),
         ]
     )
     orchestrator = ResearchOrchestrator(
@@ -374,10 +475,17 @@ def test_orchestrator_runs_agents_and_tools_in_fixed_sequential_order(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
+    llm = MockLLM(
+        [
+            *_task_actions("query a"),
+            *_task_actions("query b"),
+            *_task_actions("query c"),
+        ]
+    )
     orchestrator = ResearchOrchestrator(
         planner=OrderedPlanner(events),
         search_tool=OrderedSearchTool(events),
-        summarizer=OrderedSummarizer(events),
+        summarizer=OrderedSummarizer(events, llm),
         note_tool=OrderedNoteTool(events, NoteTool(tmp_path / "notes.jsonl")),
         report_writer=OrderedReportWriter(events),
     )
@@ -397,6 +505,290 @@ def test_orchestrator_runs_agents_and_tools_in_fixed_sequential_order(
         "note:Task C",
         "report",
     ]
+
+
+def test_orchestrator_builds_langgraph_state_graph(tmp_path: Path) -> None:
+    events: list[str] = []
+    llm = MockLLM([])
+    progress = ResearchProgressTracker()
+    orchestrator = ResearchOrchestrator(
+        planner=OrderedPlanner(events),
+        search_tool=OrderedSearchTool(events),
+        summarizer=OrderedSummarizer(events, llm),
+        note_tool=OrderedNoteTool(events, NoteTool(tmp_path / "notes.jsonl")),
+        report_writer=OrderedReportWriter(events),
+        progress=progress,
+    )
+    registry = ToolRegistry(
+        search_tool=orchestrator.search_tool,
+        summarizer=orchestrator.summarizer,
+        note_tool=orchestrator.note_tool,
+        report_writer=orchestrator.report_writer,
+        progress=progress,
+    )
+    executor = ToolCallingResearchExecutor(
+        llm=llm,
+        registry=registry,
+        progress=progress,
+    )
+
+    graph = orchestrator._build_graph(executor)
+
+    assert isinstance(graph, CompiledStateGraph)
+    assert {"plan", "execute_task", "write_report"} <= set(graph.get_graph().nodes)
+
+
+def test_orchestrator_graph_contains_evidence_and_supplemental_search_edges(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    llm = MockLLM([])
+    progress = ResearchProgressTracker()
+    orchestrator = ResearchOrchestrator(
+        planner=OrderedPlanner(events),
+        search_tool=OrderedSearchTool(events),
+        summarizer=OrderedSummarizer(events, llm),
+        note_tool=OrderedNoteTool(events, NoteTool(tmp_path / "notes.jsonl")),
+        report_writer=OrderedReportWriter(events),
+        evidence_judge=OrderedEvidenceJudge(events),
+        query_rewriter=OrderedQueryRewriter(events, ["supplemental query"]),
+        progress=progress,
+    )
+    registry = ToolRegistry(
+        search_tool=orchestrator.search_tool,
+        summarizer=orchestrator.summarizer,
+        note_tool=orchestrator.note_tool,
+        report_writer=orchestrator.report_writer,
+        progress=progress,
+        evidence_judge=orchestrator.evidence_judge,
+        query_rewriter=orchestrator.query_rewriter,
+    )
+    executor = ToolCallingResearchExecutor(
+        llm=llm,
+        registry=registry,
+        progress=progress,
+    )
+
+    graph = orchestrator._build_graph(executor).get_graph()
+    nodes = set(graph.nodes)
+    edges = {(edge.source, edge.target, edge.conditional) for edge in graph.edges}
+
+    assert {
+        "plan",
+        "execute_task",
+        "judge_evidence",
+        "rewrite_queries",
+        "supplemental_search",
+        "write_report",
+    } <= nodes
+    assert {
+        ("execute_task", "judge_evidence", True),
+        ("judge_evidence", "rewrite_queries", True),
+        ("judge_evidence", "write_report", True),
+        ("rewrite_queries", "supplemental_search", False),
+        ("supplemental_search", "judge_evidence", False),
+    } <= edges
+
+
+def test_orchestrator_runs_evidence_judge_before_report(tmp_path: Path) -> None:
+    events: list[str] = []
+    llm = MockLLM(
+        [
+            *_task_actions("query a"),
+            *_task_actions("query b"),
+            *_task_actions("query c"),
+        ]
+    )
+    orchestrator = ResearchOrchestrator(
+        planner=OrderedPlanner(events),
+        search_tool=OrderedSearchTool(events),
+        summarizer=OrderedSummarizer(events, llm),
+        note_tool=OrderedNoteTool(events, NoteTool(tmp_path / "notes.jsonl")),
+        report_writer=OrderedReportWriter(events),
+        evidence_judge=OrderedEvidenceJudge(events, is_sufficient=False),
+    )
+
+    result = asyncio.run(orchestrator.run("AI Research Agents", max_tasks=3))
+
+    assert events[-2:] == ["evidence", "report"]
+    assert [log.stage for log in result.tool_logs][-2:] == ["evidence", "report"]
+    assert result.tool_logs[-2].tool_name == "judge_evidence"
+    assert result.tool_logs[-2].output_summary == "sufficient=False, confidence=low"
+
+
+def test_orchestrator_continues_when_evidence_judge_fails(tmp_path: Path) -> None:
+    events: list[str] = []
+    llm = MockLLM(
+        [
+            *_task_actions("query a"),
+            *_task_actions("query b"),
+            *_task_actions("query c"),
+        ]
+    )
+    orchestrator = ResearchOrchestrator(
+        planner=OrderedPlanner(events),
+        search_tool=OrderedSearchTool(events),
+        summarizer=OrderedSummarizer(events, llm),
+        note_tool=OrderedNoteTool(events, NoteTool(tmp_path / "notes.jsonl")),
+        report_writer=OrderedReportWriter(events),
+        evidence_judge=FailingEvidenceJudge(),
+    )
+
+    result = asyncio.run(orchestrator.run("AI Research Agents", max_tasks=3))
+
+    assert events[-1] == "report"
+    assert result.report.markdown.startswith("# AI Research Agents")
+    evidence_log = result.tool_logs[-2]
+    assert evidence_log.stage == "evidence"
+    assert evidence_log.status == ToolCallStatus.FAILED
+    assert "evidence-secret" not in (evidence_log.error or "")
+    assert "<redacted>" in (evidence_log.error or "")
+
+
+def test_orchestrator_runs_one_supplemental_search_round_when_evidence_is_insufficient(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    llm = MockLLM(
+        [
+            *_task_actions("query a"),
+            *_task_actions("query b"),
+            *_task_actions("query c"),
+        ]
+    )
+    evidence_judge = RecordingEvidenceJudge(events, [False, True])
+    query_rewriter = OrderedQueryRewriter(
+        events,
+        ["supplemental duplicate", "supplemental new", "unused query"],
+    )
+    search_tool = SupplementalSearchTool(
+        events,
+        {
+            "query a": [_source(1)],
+            "query b": [_source(2)],
+            "query c": [_source(3)],
+            "supplemental duplicate": [_source(2)],
+            "supplemental new": [_source(4)],
+        },
+    )
+    orchestrator = ResearchOrchestrator(
+        planner=OrderedPlanner(events),
+        search_tool=search_tool,
+        summarizer=OrderedSummarizer(events, llm),
+        note_tool=OrderedNoteTool(events, NoteTool(tmp_path / "notes.jsonl")),
+        report_writer=OrderedReportWriter(events),
+        evidence_judge=evidence_judge,
+        query_rewriter=query_rewriter,
+    )
+
+    result = asyncio.run(orchestrator.run("AI Research Agents", max_tasks=3))
+
+    assert search_tool.calls == [
+        "query a",
+        "query b",
+        "query c",
+        "supplemental duplicate",
+        "supplemental new",
+    ]
+    assert [len(sources) for sources in evidence_judge.sources_by_call] == [3, 4]
+    assert query_rewriter.calls[0]["max_queries"] == 2
+    assert events[-6:] == [
+        "evidence",
+        "rewrite",
+        "search:supplemental duplicate",
+        "search:supplemental new",
+        "evidence",
+        "report",
+    ]
+    assert [log.stage for log in result.tool_logs][-6:] == [
+        "evidence",
+        "query_rewrite",
+        "search",
+        "search",
+        "evidence",
+        "report",
+    ]
+    assert result.tool_logs[-5].output_summary == "2 queries"
+
+
+def test_orchestrator_limits_supplemental_search_to_one_round(tmp_path: Path) -> None:
+    events: list[str] = []
+    llm = MockLLM(
+        [
+            *_task_actions("query a"),
+            *_task_actions("query b"),
+            *_task_actions("query c"),
+        ]
+    )
+    evidence_judge = RecordingEvidenceJudge(events, [False, False])
+    query_rewriter = OrderedQueryRewriter(events, ["supplemental one", "supplemental two"])
+    search_tool = SupplementalSearchTool(
+        events,
+        {
+            "query a": [_source(1)],
+            "query b": [_source(2)],
+            "query c": [_source(3)],
+            "supplemental one": [_source(4)],
+            "supplemental two": [_source(5)],
+        },
+    )
+    orchestrator = ResearchOrchestrator(
+        planner=OrderedPlanner(events),
+        search_tool=search_tool,
+        summarizer=OrderedSummarizer(events, llm),
+        note_tool=OrderedNoteTool(events, NoteTool(tmp_path / "notes.jsonl")),
+        report_writer=OrderedReportWriter(events),
+        evidence_judge=evidence_judge,
+        query_rewriter=query_rewriter,
+    )
+
+    result = asyncio.run(orchestrator.run("AI Research Agents", max_tasks=3))
+
+    assert search_tool.calls.count("supplemental one") == 1
+    assert search_tool.calls.count("supplemental two") == 1
+    assert events.count("rewrite") == 1
+    assert events.count("evidence") == 2
+    assert events[-1] == "report"
+    assert result.report.markdown.startswith("# AI Research Agents")
+    assert "证据不足" in result.report.markdown
+    assert "仅供参考" in result.report.markdown
+
+
+def test_orchestrator_continues_when_supplemental_search_fails(tmp_path: Path) -> None:
+    events: list[str] = []
+    llm = MockLLM(
+        [
+            *_task_actions("query a"),
+            *_task_actions("query b"),
+            *_task_actions("query c"),
+        ]
+    )
+    orchestrator = ResearchOrchestrator(
+        planner=OrderedPlanner(events),
+        search_tool=SupplementalSearchTool(
+            events,
+            {
+                "query a": [_source(1)],
+                "query b": [_source(2)],
+                "query c": [_source(3)],
+            },
+        ),
+        summarizer=OrderedSummarizer(events, llm),
+        note_tool=OrderedNoteTool(events, NoteTool(tmp_path / "notes.jsonl")),
+        report_writer=OrderedReportWriter(events),
+        evidence_judge=RecordingEvidenceJudge(events, [False, False]),
+        query_rewriter=OrderedQueryRewriter(events, ["failed supplemental"]),
+    )
+
+    result = asyncio.run(orchestrator.run("AI Research Agents", max_tasks=3))
+
+    assert result.report.markdown.startswith("# AI Research Agents")
+    assert events[-1] == "report"
+    failed_search_logs = [
+        log for log in result.tool_logs if log.stage == "search" and log.status == ToolCallStatus.FAILED
+    ]
+    assert len(failed_search_logs) == 1
+    assert failed_search_logs[0].error == "Supplemental search failed."
 
 
 def test_orchestrator_error_events_and_logs_do_not_expose_api_keys(
@@ -422,7 +814,10 @@ def test_orchestrator_error_events_and_logs_do_not_expose_api_keys(
                         "query": "query c",
                     },
                 ]
-            )
+            ),
+            _action("search_web", {"query": "query a"}),
+            _action("search_web", {"query": "query b"}),
+            _action("search_web", {"query": "query c"}),
         ]
     )
     progress = ResearchProgressTracker()
@@ -471,8 +866,9 @@ def test_orchestrator_builds_fallback_report_when_report_writer_output_is_invali
                     },
                 ]
             ),
-            "### Summary A\nFinding A [1].",
-            "### Summary B\nFinding B [1].",
+            *_task_script("query a", "### Summary A\nFinding A [1]."),
+            *_task_script("query b", "### Summary B\nFinding B [1]."),
+            _action("search_web", {"query": "failed query"}),
         ]
     )
     progress = ResearchProgressTracker()
@@ -506,3 +902,28 @@ def test_orchestrator_builds_fallback_report_when_report_writer_output_is_invali
         event.type == SSEEventType.REPORT and "兜底" not in str(event.data)
         for event in progress.events
     )
+
+
+def test_orchestrator_fallback_report_includes_evidence_status(tmp_path: Path) -> None:
+    events: list[str] = []
+    llm = MockLLM(
+        [
+            *_task_actions("query a"),
+            *_task_actions("query b"),
+            *_task_actions("query c"),
+        ]
+    )
+    orchestrator = ResearchOrchestrator(
+        planner=OrderedPlanner(events),
+        search_tool=OrderedSearchTool(events),
+        summarizer=OrderedSummarizer(events, llm),
+        note_tool=OrderedNoteTool(events, NoteTool(tmp_path / "notes.jsonl")),
+        report_writer=FailingReportWriter(),
+        evidence_judge=OrderedEvidenceJudge(events, is_sufficient=False),
+    )
+
+    result = asyncio.run(orchestrator.run("AI Research Agents", max_tasks=3))
+
+    assert "证据不足" in result.report.markdown
+    assert "Need more sources." in result.report.markdown
+    assert result.tool_logs[-1].tool_name == "StructuredFallbackReportWriter"

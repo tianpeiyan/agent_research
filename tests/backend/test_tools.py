@@ -158,3 +158,43 @@ def test_note_tool_saves_task_summary_sources_tags_and_time(tmp_path: Path) -> N
     assert persisted["sources"][0]["url"] == "https://example.com/report"
     assert persisted["tags"] == ["market", "phase-4"]
     assert persisted["created_at"].endswith("Z") or "+00:00" in persisted["created_at"]
+
+
+def test_note_tool_remains_append_only_jsonl_task_artifact(tmp_path: Path) -> None:
+    notes_path = tmp_path / "notes.jsonl"
+    tool = NoteTool(notes_path)
+    source = SearchResult(
+        title="Example report",
+        url="https://example.com/report",
+        snippet="Market detail.",
+        source="example.com",
+    )
+
+    first = tool.save(
+        TaskSummary(
+            task_title="Task A",
+            content="First task finding [1].",
+            sources=[source],
+        ),
+        tags=["research"],
+    )
+    second = tool.save(
+        TaskSummary(
+            task_title="Task B",
+            content="Second task finding [1].",
+            sources=[source],
+        ),
+        tags=["research"],
+    )
+
+    persisted = [
+        json.loads(line)
+        for line in notes_path.read_text(encoding="utf-8").strip().splitlines()
+    ]
+    assert [record["task_title"] for record in persisted] == ["Task A", "Task B"]
+    assert [record["summary_content"] for record in persisted] == [
+        "First task finding [1].",
+        "Second task finding [1].",
+    ]
+    assert first.task_title == "Task A"
+    assert second.task_title == "Task B"

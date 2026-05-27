@@ -46,7 +46,9 @@ interface LogEntry {
   time: string;
 }
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+const API_BASE_URL = normalizeApiBaseUrl(
+  import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV ? "/api" : "http://localhost:8000"),
+);
 
 const topic = ref("");
 const maxTasks = ref(3);
@@ -70,15 +72,18 @@ const allSources = computed(() => {
     return true;
   });
 });
-const renderedReport = computed(() =>
-  report.value ? renderMarkdown(report.value.markdown) : "",
-);
+const renderedReport = computed(() => (report.value ? renderMarkdown(report.value.markdown) : ""));
 
-function startResearch() {
+async function startResearch() {
   if (!canStart.value) return;
   resetState();
   isRunning.value = true;
   currentStatus.value = "正在连接";
+
+  if (!(await ensureBackendAvailable())) {
+    isRunning.value = false;
+    return;
+  }
 
   const params = new URLSearchParams({
     topic: topic.value.trim(),
@@ -124,6 +129,39 @@ function resetState() {
   report.value = null;
   logs.value = [];
   closeStream();
+}
+
+function normalizeApiBaseUrl(url: string) {
+  return url.replace(/\/$/, "");
+}
+
+async function ensureBackendAvailable() {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 3000);
+
+  try {
+    const response = await fetch(`${API_BASE_URL}/health`, {
+      signal: controller.signal,
+    });
+    if (response.ok) return true;
+    handleTransportError(backendUnavailableMessage());
+    return false;
+  } catch {
+    handleTransportError(backendUnavailableMessage());
+    return false;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function backendUnavailableMessage() {
+  if (API_BASE_URL === "/api") {
+    return (
+      "找不到后端服务。请确认后端已在 http://localhost:8000 运行，" +
+      "再刷新或重新点击开始。"
+    );
+  }
+  return `找不到后端服务。请确认 ${API_BASE_URL} 可以访问。`;
 }
 
 function closeStream() {

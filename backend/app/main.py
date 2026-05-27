@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
-from app.agents import ReportWriter, TaskSummarizer, TodoPlanner
+from app.agents import EvidenceJudge, QueryRewriter, ReportWriter, TaskSummarizer, TodoPlanner
 from app.config import get_settings
 from app.llm import BailianLLMProvider
 from app.models import ErrorResponse, ResearchRequest, SSEEventType
@@ -44,9 +44,11 @@ def create_research_orchestrator(
             base_url=settings.tavily_base_url,
             max_results=min(settings.max_search_results, 5),
         ),
-        summarizer=TaskSummarizer(llm),
+        summarizer=TaskSummarizer(llm, skill_name="research-task-summarizer"),
         note_tool=NoteTool(Path(settings.notes_path)),
         report_writer=ReportWriter(llm),
+        evidence_judge=EvidenceJudge(llm),
+        query_rewriter=QueryRewriter(llm),
         progress=progress,
     )
 

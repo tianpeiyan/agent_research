@@ -33,6 +33,46 @@ class ToolCallStatus(StrEnum):
     FAILED = "failed"
 
 
+class EvidenceConfidence(StrEnum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class ToolDefinition(BaseModel):
+    name: NonEmptyShortText
+    description: NonEmptyShortText
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolCallRequest(BaseModel):
+    action: NonEmptyShortText
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    reason: NonEmptyShortText
+    call_id: str | None = None
+
+
+class ToolCallResult(BaseModel):
+    action: NonEmptyShortText
+    success: bool
+    result: dict[str, Any] | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    call_id: str | None = None
+
+
+class ToolCallingTurn(BaseModel):
+    content: str | None = None
+    tool_calls: list[ToolCallRequest] = Field(default_factory=list)
+
+
+class ToolExecutionError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class ResearchRequest(BaseModel):
     topic: Annotated[
         str,
@@ -63,6 +103,13 @@ class TaskSummary(BaseModel):
     task_title: NonEmptyShortText
     content: NonEmptyShortText
     sources: list[SearchResult] = Field(default_factory=list)
+
+
+class EvidenceJudgement(BaseModel):
+    is_sufficient: bool
+    confidence: EvidenceConfidence
+    gaps: list[NonEmptyShortText] = Field(default_factory=list)
+    rationale: NonEmptyShortText
 
 
 class NoteRecord(BaseModel):

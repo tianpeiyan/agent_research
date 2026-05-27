@@ -1,4 +1,4 @@
-import { mount } from "@vue/test-utils";
+import { flushPromises, mount } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../src/App.vue";
@@ -41,6 +41,7 @@ describe("App", () => {
   beforeEach(() => {
     MockEventSource.instances = [];
     vi.stubGlobal("EventSource", MockEventSource);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(null, { status: 200 }))));
   });
 
   afterEach(() => {
@@ -65,8 +66,11 @@ describe("App", () => {
 
     await wrapper.get("input").setValue("AI agent evaluation");
     await wrapper.get("form").trigger("submit");
+    await flushPromises();
 
     const source = MockEventSource.instances[0];
+    expect(fetch).toHaveBeenCalledWith("/api/health", expect.any(Object));
+    expect(source.url).toContain("/api/research/stream?");
     expect(source.url).toContain("/research/stream?");
     expect(source.url).toContain("topic=AI+agent+evaluation");
     expect(source.url).toContain("max_tasks=3");
@@ -141,6 +145,7 @@ describe("App", () => {
 
     await wrapper.get("input").setValue("AI agent evaluation");
     await wrapper.get("form").trigger("submit");
+    await flushPromises();
 
     const source = MockEventSource.instances[0];
     source.emit("error", { message: "Tavily search returned no results." });
@@ -157,6 +162,7 @@ describe("App", () => {
 
     await wrapper.get("input").setValue("AI agent evaluation");
     await wrapper.get("form").trigger("submit");
+    await flushPromises();
 
     const source = MockEventSource.instances[0];
     source.emitTransportError();
@@ -164,5 +170,19 @@ describe("App", () => {
 
     expect(wrapper.text()).toContain("连接中断，请确认后端服务正在运行。");
     expect(source.close).toHaveBeenCalled();
+  });
+
+  it("checks backend health before opening the research stream", async () => {
+    vi.mocked(fetch).mockRejectedValueOnce(new Error("connection refused"));
+    const wrapper = mount(App);
+
+    await wrapper.get("input").setValue("AI agent evaluation");
+    await wrapper.get("form").trigger("submit");
+    await flushPromises();
+
+    expect(MockEventSource.instances).toHaveLength(0);
+    expect(wrapper.get('[role="alert"]').text()).toBe(
+      "找不到后端服务。请确认后端已在 http://localhost:8000 运行，再刷新或重新点击开始。",
+    );
   });
 });

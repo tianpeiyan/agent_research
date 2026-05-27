@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Task Summarizer"
+  short_description: "Summarize search evidence into cited task summaries."
+  default_prompt: "Use this skill to summarize a research task from search results with citations and evidence limits."
